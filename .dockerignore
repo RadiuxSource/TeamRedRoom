@@ -1,0 +1,9 @@
+node_modules
+.next
+.env*
+.vscode
+.git
+dist
+*.log
+/tmp
+public/last_confession.png
