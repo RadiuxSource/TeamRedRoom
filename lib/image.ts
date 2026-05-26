@@ -1,5 +1,151 @@
 import * as PImage from 'pureimage';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { Readable } from 'stream';
+
+type RichToken = {
+  kind: 'text' | 'space' | 'emoji' | 'newline';
+  value: string;
+};
+
+const TWEMOJI_BASE_URL = 'https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72';
+const emojiBitmapCache = new Map<string, Promise<any | null>>();
+
+function isEmojiCluster(cluster: string) {
+  return /[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}\u{20E3}\u{FE0F}\u{200D}]/u.test(cluster);
+}
+
+function toEmojiCodePointString(emoji: string) {
+  return Array.from(emoji)
+    .map((character) => character.codePointAt(0)?.toString(16))
+    .filter(Boolean)
+    .join('-');
+}
+
+function tokenizeRichText(text: string): RichToken[] {
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  const tokens: RichToken[] = [];
+  let textBuffer = '';
+
+  const flushText = () => {
+    if (textBuffer) {
+      tokens.push({ kind: 'text', value: textBuffer });
+      textBuffer = '';
+    }
+  };
+
+  for (const { segment } of segmenter.segment(text)) {
+    if (segment === '\n') {
+      flushText();
+      tokens.push({ kind: 'newline', value: segment });
+      continue;
+    }
+
+    if (/^\s+$/u.test(segment)) {
+      flushText();
+      tokens.push({ kind: 'space', value: segment });
+      continue;
+    }
+
+    if (isEmojiCluster(segment)) {
+      flushText();
+      tokens.push({ kind: 'emoji', value: segment });
+      continue;
+    }
+
+    textBuffer += segment;
+  }
+
+  flushText();
+  return tokens;
+}
+
+function measureTokenWidth(ctx: any, token: RichToken, fontSize: number) {
+  if (token.kind === 'emoji') {
+    return Math.round(fontSize * 1.15);
+  }
+
+  return ctx.measureText(token.value).width;
+}
+
+function wrapRichText(ctx: any, text: string, maxWidth: number, fontSize: number) {
+  const tokens = tokenizeRichText(text);
+  const lines: RichToken[][] = [];
+  let currentLine: RichToken[] = [];
+  let currentWidth = 0;
+
+  const commitLine = () => {
+    while (currentLine.length && currentLine[0].kind === 'space') {
+      currentLine.shift();
+    }
+
+    while (currentLine.length && currentLine[currentLine.length - 1].kind === 'space') {
+      currentLine.pop();
+    }
+
+    lines.push(currentLine);
+    currentLine = [];
+    currentWidth = 0;
+  };
+
+  for (const token of tokens) {
+    if (token.kind === 'newline') {
+      commitLine();
+      continue;
+    }
+
+    if (token.kind === 'space' && currentLine.length === 0) {
+      continue;
+    }
+
+    const tokenWidth = measureTokenWidth(ctx, token, fontSize);
+
+    if (currentLine.length > 0 && currentWidth + tokenWidth > maxWidth) {
+      commitLine();
+      if (token.kind === 'space') {
+        continue;
+      }
+    }
+
+    currentLine.push(token);
+    currentWidth += tokenWidth;
+  }
+
+  if (currentLine.length) {
+    commitLine();
+  }
+
+  return lines;
+}
+
+async function loadEmojiBitmap(emoji: string) {
+  const codePointString = toEmojiCodePointString(emoji);
+
+  if (!codePointString) {
+    return null;
+  }
+
+  if (!emojiBitmapCache.has(codePointString)) {
+    emojiBitmapCache.set(
+      codePointString,
+      (async () => {
+        try {
+          const response = await fetch(`${TWEMOJI_BASE_URL}/${codePointString}.png`);
+          if (!response.ok) {
+            return null;
+          }
+
+          const buffer = Buffer.from(await response.arrayBuffer());
+          return await PImage.decodePNGFromStream(Readable.from([buffer]) as any);
+        } catch (error) {
+          console.warn('Emoji bitmap load failed', error);
+          return null;
+        }
+      })()
+    );
+  }
+
+  return emojiBitmapCache.get(codePointString) as Promise<any | null>;
+}
 
 function wrapText(ctx: any, text: string, maxWidth: number) {
   const words = text.split(/\s+/).filter(Boolean);
@@ -52,8 +198,8 @@ function fitWrappedFontSize(
 ) {
   for (let size = maxSize; size >= minSize; size -= 1) {
     ctx.font = `${size}pt ${fontFamily}`;
-    const lines = wrapText(ctx, text, maxWidth);
-    const lineHeight = Math.round(size * 1.38);
+    const lines = wrapRichText(ctx, text, maxWidth, size);
+    const lineHeight = Math.round(Math.max(size * 1.38, size * 1.22));
     const totalHeight = lines.length * lineHeight;
 
     if (totalHeight <= maxHeight) {
@@ -62,9 +208,56 @@ function fitWrappedFontSize(
   }
 
   ctx.font = `${minSize}pt ${fontFamily}`;
-  const lines = wrapText(ctx, text, maxWidth);
-  const lineHeight = Math.round(minSize * 1.38);
+  const lines = wrapRichText(ctx, text, maxWidth, minSize);
+  const lineHeight = Math.round(Math.max(minSize * 1.38, minSize * 1.22));
   return { size: minSize, lines, lineHeight };
+}
+
+async function drawRichLine(
+  ctx: any,
+  line: RichToken[],
+  x: number,
+  baselineY: number,
+  fontSize: number,
+  fontFamily: string,
+) {
+  const emojiSize = Math.round(fontSize * 1.15);
+  let cursorX = x;
+
+  for (const token of line) {
+    if (token.kind === 'emoji') {
+      const bitmap = await loadEmojiBitmap(token.value);
+
+      if (bitmap) {
+        ctx.drawImage(
+          bitmap,
+          0,
+          0,
+          bitmap.width,
+          bitmap.height,
+          cursorX,
+          baselineY - Math.round(emojiSize * 0.82),
+          emojiSize,
+          emojiSize
+        );
+        cursorX += emojiSize;
+        continue;
+      }
+    }
+
+    ctx.font = `${fontSize}pt ${fontFamily}`;
+
+    if (token.kind === 'space') {
+      cursorX += ctx.measureText(token.value).width;
+      continue;
+    }
+
+    ctx.fillStyle = 'rgba(0,0,0,0.20)';
+    ctx.fillText(token.value, cursorX + 2, baselineY + 2);
+    ctx.fillStyle = 'rgba(22,28,38,0.98)';
+    ctx.fillText(token.value, cursorX, baselineY);
+    cursorX += ctx.measureText(token.value).width;
+  }
 }
 
 function drawRoundedCard(
@@ -188,20 +381,18 @@ export async function generateConfessionImage(confession: string, options: Image
 
   let y = confessionStartY;
   for (const line of confessionLines) {
-    ctx.fillStyle = 'rgba(0,0,0,0.20)';
-    ctx.fillText(line, width / 2 + 2, y + 2);
-    ctx.fillStyle = 'rgba(22,28,38,0.98)';
-    ctx.fillText(line, width / 2, y);
+    const lineWidth = line.reduce((total, token) => total + measureTokenWidth(ctx, token, confessionFit.size), 0);
+    const startX = width / 2 - lineWidth / 2;
+    await drawRichLine(ctx, line, startX, y, confessionFit.size, bodyFont);
     y += confessionFit.lineHeight;
   }
 
   if (handleLine) {
-    ctx.font = `${handleFontSize}pt ${bodyFont}`;
+    const handleTokens = wrapRichText(ctx, handleLine, textMaxWidth, handleFontSize)[0] || [];
+    const handleWidth = handleTokens.reduce((total, token) => total + measureTokenWidth(ctx, token, handleFontSize), 0);
+    const startX = width / 2 - handleWidth / 2;
     const handleY = cardY + cardSize - 62;
-    ctx.fillStyle = 'rgba(0,0,0,0.20)';
-    ctx.fillText(handleLine, width / 2 + 2, handleY + 2);
-    ctx.fillStyle = 'rgba(14,65,128,0.98)';
-    ctx.fillText(handleLine, width / 2, handleY);
+    await drawRichLine(ctx, handleTokens, startX, handleY, handleFontSize, bodyFont);
   }
 
   // encode to PNG via a temp file and read buffer

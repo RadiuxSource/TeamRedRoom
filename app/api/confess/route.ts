@@ -8,6 +8,25 @@ type ConfessionRequest = {
   instagramId?: unknown;
 };
 
+// Process heavy Telegram/image work off the request path to keep API responses fast.
+let forwardQueue: Promise<void> = Promise.resolve();
+
+function enqueueTelegramForward(payload: {
+  adminHtml: string;
+  confession: string;
+  instagramId: string;
+  sendImage: boolean;
+}) {
+  forwardQueue = forwardQueue
+    .then(async () => {
+      await sendTelegramMessage(payload);
+    })
+    .catch((error) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error("[confess] Background forward failed:", reason);
+    });
+}
+
 function normalizeText(value: unknown): string {
   if (typeof value !== "string") {
     return "";
@@ -25,10 +44,6 @@ function normalizeInstagramId(value: unknown): string {
 
   const cleaned = raw.replace(/^@+/, "");
   return cleaned.replace(/\s+/g, "");
-}
-
-function toBoolean(value: unknown): boolean {
-  return value === true || value === "true" || value === 1;
 }
 
 export async function POST(request: Request) {
@@ -60,7 +75,6 @@ export async function POST(request: Request) {
   }
 
   const now = new Date().toUTCString();
-  const showHandleInImage = Boolean(instagramId);
 
   // Compact NGL-like admin HTML
   const html: string[] = [];
@@ -71,19 +85,13 @@ export async function POST(request: Request) {
 
   const messagePayload = html.join("\n");
 
-  try {
-    // Request forwarder to generate an image and post it
-    await sendTelegramMessage({
-      adminHtml: messagePayload,
-      confession,
-      instagramId,
-      showInstagramId: showHandleInImage,
-      sendImage: true
-    });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "Unknown Telegram error.";
-    return NextResponse.json({ message: `Telegram forwarding failed: ${reason}` }, { status: 500 });
-  }
+  // Queue forwarding work and return immediately for a fast UX.
+  enqueueTelegramForward({
+    adminHtml: messagePayload,
+    confession,
+    instagramId,
+    sendImage: true,
+  });
 
-  return NextResponse.json({ message: "Confession sent to Telegram." });
+  return NextResponse.json({ message: "Confession received. Processing now." }, { status: 202 });
 }
